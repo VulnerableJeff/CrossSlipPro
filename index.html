@@ -135,7 +135,7 @@
     });
 
     const e = React.createElement;
-    const { useState, useEffect, useCallback, useRef } = React;
+    const { useState, useEffect, useCallback, useRef, useMemo } = React;
 
     const clamp01 = (x) => Math.max(0, Math.min(1, x));
     const americanToProb = (odds) => (odds > 0 ? 100 / (odds + 100) : -odds / (-odds + 100));
@@ -182,6 +182,26 @@
     }
 
     function bytes(n){return n>1048576? (n/1048576).toFixed(1)+' MB' : n>1024? (n/1024).toFixed(1)+' KB' : n+' B'}
+
+    const usd = new Intl.NumberFormat(undefined,{style:'currency',currency:'USD',maximumFractionDigits:2});
+    const pctFmt = new Intl.NumberFormat(undefined,{style:'percent',maximumFractionDigits:1});
+
+    function formatCurrency(n){
+      if(!Number.isFinite(n)) return '$0.00';
+      return usd.format(n);
+    }
+
+    function formatPercent(n){
+      if(!Number.isFinite(n)) return '0%';
+      return pctFmt.format(n);
+    }
+
+    function toCsv(rows){
+      return rows.map(row=>row.map(cell=>{
+        const text = cell==null ? '' : String(cell);
+        return /[",\n]/.test(text) ? '"'+text.replace(/"/g,'""')+'"' : text;
+      }).join(',')).join('\n');
+    }
 
     function findAmericanOdds(text){
       const m = text && text.match(ODDS_RE);
@@ -335,6 +355,7 @@
         ev,
         kelly,
         edge,
+        updatedAt: Date.now(),
       };
       enriched.summary = craftSummary(enriched);
       return enriched;
@@ -508,6 +529,49 @@
       })();
       const [bankroll, setBankroll] = useState(initialBankroll);
 
+      const summary = useMemo(()=>{
+        if(!results.length){
+          return {count:0,totalStake:0,totalEv:0,kellyStake:0,avgEdge:0,avgKelly:0,positive:0,hitRate:0};
+        }
+        let totalStake = 0;
+        let totalEv = 0;
+        let kellyStake = 0;
+        let totalEdge = 0;
+        let totalKelly = 0;
+        let positive = 0;
+        for(const rec of results){
+          const stake = Number.isFinite(rec.stake) ? rec.stake : 0;
+          const ev = Number.isFinite(rec.ev) ? rec.ev : 0;
+          const kelly = Number.isFinite(rec.kelly) ? rec.kelly : 0;
+          const edge = Number.isFinite(rec.edge) ? rec.edge : 0;
+          totalStake += stake;
+          totalEv += ev;
+          totalEdge += edge;
+          totalKelly += kelly;
+          kellyStake += kelly * bankroll;
+          if((rec.model ?? rec.base ?? 0.5) >= (rec.base ?? 0.5)) positive += 1;
+        }
+        const count = results.length;
+        return {
+          count,
+          totalStake,
+          totalEv,
+          kellyStake,
+          avgEdge: totalEdge / count,
+          avgKelly: totalKelly / count,
+          positive,
+          hitRate: positive / count,
+        };
+      },[results,bankroll]);
+
+      const sortedResults = useMemo(()=>{
+        return [...results].sort((a,b)=>{
+          const aStamp = a.updatedAt || a.createdAt || 0;
+          const bStamp = b.updatedAt || b.createdAt || 0;
+          return bStamp - aStamp;
+        });
+      },[results]);
+
       useEffect(()=>{ if(typeof localStorage==='undefined') return; localStorage.setItem('csu_bankroll', String(bankroll)); },[bankroll]);
 
       useEffect(()=>{
@@ -528,7 +592,7 @@
         const btn = document.getElementById('exportCsv');
         if(!btn) return;
         const handler = ()=>{
-          const rows = [['Title','Odds','Implied','Adjusted','Stake','EV','Kelly','Kelly $','Summary','Notes']];
+          const rows = [['Title','Odds','Implied','Adjusted','Stake','EV','Kelly','Kelly $','Summary','Notes','Source']];
           for(const rec of results){
             const k$ = ((rec.kelly??0)*bankroll) || 0;
             const oddsLabel = rec.american!=null && rec.american!=='' ? (rec.american>0?`+${rec.american}`:String(rec.american)) : '';
@@ -542,10 +606,11 @@
               (rec.kelly??0).toFixed(3),
               k$.toFixed(2),
               (rec.summary||'').replace(/\s+/g,' ').trim(),
-              (rec.notes||'').replace(/\s+/g,' ').trim()
+              (rec.notes||'').replace(/\s+/g,' ').trim(),
+              (rec.fileName||'')
             ]);
           }
-          const csv = rows.map(r=>r.join(',')).join('\n');
+          const csv = toCsv(rows);
           const blob = new Blob([csv],{type:'text/csv'});
           const u = URL.createObjectURL(blob);
           const a = document.createElement('a');
@@ -630,11 +695,27 @@
       },[analyzeOne]);
 
       const updateSlip = useCallback((id, patch)=>{
-        setResults(prev => prev.map(slip => slip.id===id ? buildSlipMetrics({...slip, ...patch}, teams) : slip));
+        setResults(prev => prev.map(slip => slip.id===id ? buildSlipMetrics({...slip, ...patch, updatedAt: Date.now()}, teams) : slip));
       },[teams]);
 
       const removeSlip = useCallback((id)=>{
         setResults(prev => prev.filter(slip => slip.id!==id));
+      },[]);
+
+      const clearResults = useCallback(()=>{
+        if(!results.length) return;
+        const proceed = typeof window === 'undefined' ? true : window.confirm('Clear all analyzed slips?');
+        if(proceed){
+          setResults([]);
+          setFiles([]);
+        }
+      },[results.length]);
+
+      const resetTeams = useCallback(()=>{
+        const proceed = typeof window === 'undefined' ? true : window.confirm('Reset team adjustments to defaults?');
+        if(proceed){
+          setTeams(cloneTeams());
+        }
       },[]);
 
       function recomputeAll(){
@@ -682,14 +763,30 @@
           e('div',{className:'row',style:{marginTop:10,alignItems:'center',justifyContent:'space-between'}},
             e('label',null,
               e('input',{type:'checkbox',checked:auto,onChange:(ev)=>setAuto(ev.target.checked)}),' Live Auto‑Recompute'),
-            e('button',{className:'btn btn-primary',onClick:recomputeAll},'Recompute Model')
+            e('div',{className:'row',style:{gap:8}},
+              e('button',{className:'btn btn-ghost',onClick:resetTeams},'Reset teams'),
+              e('button',{className:'btn btn-primary',onClick:recomputeAll},'Recompute Model')
+            )
           )
         ),
         e('section',{className:'panel'},
           e('h3',null,'Results'),
-          results.length
+          summary.count ? e('div',{className:'row',style:{justifyContent:'space-between',alignItems:'center',gap:10,flexWrap:'wrap',marginBottom:12}},
+              e('div',{className:'badges',style:{marginTop:0}},
+                e('div',{className:'badge',key:'count'}, `${summary.count} slips`),
+                e('div',{className:'badge',key:'stake'}, `Stake ${formatCurrency(summary.totalStake)}`),
+                e('div',{className:'badge',key:'ev'}, `EV ${formatCurrency(summary.totalEv)}`),
+                e('div',{className:'badge',key:'kellySum'}, `Kelly roll ${formatCurrency(summary.kellyStake)}`),
+                e('div',{className:'badge',key:'edge'}, `Avg edge ${(summary.avgEdge*100).toFixed(1)} pts`),
+                e('div',{className:'badge',key:'hit'}, `Positive leans ${formatPercent(summary.hitRate)}`)
+              ),
+              e('div',{className:'row',style:{gap:8}},
+                e('button',{className:'btn btn-ghost btn-small',onClick:clearResults},'Clear all')
+              )
+            ) : null,
+          summary.count
             ? e('div',{className:'row',style:{gap:14,alignItems:'stretch',flexWrap:'wrap'}},
-                results.map(slip=>e(SlipCard,{
+                sortedResults.map(slip=>e(SlipCard,{
                   key:slip.id,
                   slip,
                   bankroll,
