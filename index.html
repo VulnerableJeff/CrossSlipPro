@@ -135,7 +135,7 @@
     });
 
     const e = React.createElement;
-    const { useState, useEffect, useCallback } = React;
+    const { useState, useEffect, useCallback, useRef } = React;
 
     const clamp01 = (x) => Math.max(0, Math.min(1, x));
     const americanToProb = (odds) => (odds > 0 ? 100 / (odds + 100) : -odds / (-odds + 100));
@@ -146,6 +146,40 @@
     const MONEY_STRIP_RE = /\$?[\d,]+(?:\.\d+)?/g;
     const LS_RESULTS = "csu_results_v3";
     const LS_TEAMS   = "csu_teams_v2";
+
+    const DEFAULT_TEAMS = Object.freeze({
+      A:{name:'',win:0.5,margin:0,inj:0,wl:'-----'},
+      B:{name:'',win:0.5,margin:0,inj:0,wl:'-----'}
+    });
+
+    function cloneTeams(src){
+      return {
+        A:{...DEFAULT_TEAMS.A,...(src && src.A || {})},
+        B:{...DEFAULT_TEAMS.B,...(src && src.B || {})},
+      };
+    }
+
+    function loadStoredTeams(){
+      if(typeof localStorage==='undefined') return cloneTeams();
+      try{
+        const parsed = JSON.parse(localStorage.getItem(LS_TEAMS) || 'null');
+        if(parsed && parsed.A && parsed.B){
+          return cloneTeams(parsed);
+        }
+      }catch(_){ }
+      return cloneTeams();
+    }
+
+    function loadStoredResults(teams){
+      if(typeof localStorage==='undefined') return [];
+      try{
+        const parsed = JSON.parse(localStorage.getItem(LS_RESULTS) || '[]');
+        if(Array.isArray(parsed)){
+          return parsed.map(item=>buildSlipMetrics(item, teams));
+        }
+      }catch(_){ }
+      return [];
+    }
 
     function bytes(n){return n>1048576? (n/1048576).toFixed(1)+' MB' : n>1024? (n/1024).toFixed(1)+' KB' : n+' B'}
 
@@ -358,16 +392,17 @@
 
     function TeamCard({ side='A', data, onChange }){
       const set=(k,v)=>onChange({...data,[k]:v});
+      const parseNumber=(raw)=> raw==='' ? '' : Number(raw);
       return e('div',{className:'team'},
         e('div',{className:'k'}, `Team ${side}`),
         e('div',{className:'row'},
           e('input',{className:'input',placeholder:'Team name (optional)', value:data.name||'', onChange:e=>set('name',e.target.value)}),
           e('input',{className:'input num',type:'number',step:'0.01',min:'0',max:'1',placeholder:'Win%',
-            value:data.win ?? '', onChange:e=>set('win',Number(e.target.value))}),
+            value:data.win ?? '', onChange:e=>set('win',parseNumber(e.target.value))}),
           e('input',{className:'input num',type:'number',step:'1',placeholder:'+/- margin',
-            value:data.margin ?? '', onChange:e=>set('margin',Number(e.target.value))}),
+            value:data.margin ?? '', onChange:e=>set('margin',parseNumber(e.target.value))}),
           e('input',{className:'input num',type:'number',step:'1',placeholder:'Injuries',
-            value:data.inj ?? '', onChange:e=>set('inj',Number(e.target.value))}),
+            value:data.inj ?? '', onChange:e=>set('inj',parseNumber(e.target.value))}),
         ),
         e('div',{className:'k',style:{marginTop:8}},'Last 5 (tap to set):'),
         e(WLPicker,{value:data.wl||'-----', onChange:(wl)=>set('wl',wl)})
@@ -456,45 +491,70 @@
     }
 
     function App(){
-      const [results,setResults] = useState([]);
+      const initialTeamsRef = useRef(null);
+      if(initialTeamsRef.current==null){
+        initialTeamsRef.current = loadStoredTeams();
+      }
+
+      const [teams,setTeams] = useState(initialTeamsRef.current);
+      const [results,setResults] = useState(()=>loadStoredResults(initialTeamsRef.current));
       const [files,setFiles] = useState([]);
       const [imgUrl,setImgUrl] = useState('');
       const [auto,setAuto] = useState(true);
-      const [teams,setTeams] = useState({A:{name:'',win:0.5,margin:0,inj:0,wl:'-----'}, B:{name:'',win:0.5,margin:0,inj:0,wl:'-----'}});
-      const [bankroll, setBankroll] = useState(Number(localStorage.getItem('csu_bankroll')||2500));
+      const initialBankroll = (()=>{
+        if(typeof localStorage==='undefined') return 2500;
+        const raw = Number(localStorage.getItem('csu_bankroll'));
+        return Number.isFinite(raw) ? raw : 2500;
+      })();
+      const [bankroll, setBankroll] = useState(initialBankroll);
 
-      useEffect(()=>{ localStorage.setItem('csu_bankroll', String(bankroll)); },[bankroll]);
+      useEffect(()=>{ if(typeof localStorage==='undefined') return; localStorage.setItem('csu_bankroll', String(bankroll)); },[bankroll]);
 
-      // wire input control in header
-      const brEl = document.getElementById('bankroll');
-      if(brEl){ brEl.value = String(bankroll); brEl.oninput = (ev)=> setBankroll(Number(ev.target.value||0)); }
+      useEffect(()=>{
+        const brEl = document.getElementById('bankroll');
+        if(!brEl) return;
+        const handler = (ev)=>{
+          const val = ev.target.value;
+          if(val===''){ setBankroll(0); return; }
+          const parsed = Number(val);
+          if(Number.isFinite(parsed)) setBankroll(parsed);
+        };
+        brEl.value = String(bankroll);
+        brEl.addEventListener('input', handler);
+        return ()=> brEl.removeEventListener('input', handler);
+      },[bankroll]);
 
-      // CSV export
-      document.getElementById('exportCsv').onclick = ()=>{
-        const rows = [['Title','Odds','Implied','Adjusted','Stake','EV','Kelly','Kelly $','Summary','Notes']];
-        for(const rec of results){
-          const k$ = ((rec.kelly??0)*bankroll) || 0;
-          const oddsLabel = rec.american!=null && rec.american!=='' ? (rec.american>0?`+${rec.american}`:String(rec.american)) : '';
-          rows.push([
-            rec.title || rec.fileName || 'Bet',
-            oddsLabel,
-            Math.round((rec.base??0.5)*100)+'%',
-            Math.round((rec.model??rec.base??0.5)*100)+'%',
-            (rec.stake??100).toFixed(2),
-            (rec.ev??0).toFixed(2),
-            (rec.kelly??0).toFixed(3),
-            k$.toFixed(2),
-            (rec.summary||'').replace(/\s+/g,' ').trim(),
-            (rec.notes||'').replace(/\s+/g,' ').trim()
-          ]);
-        }
-        const csv = rows.map(r=>r.join(',')).join('\n');
-        const blob = new Blob([csv],{type:'text/csv'});
-        const u = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = u; a.download = 'csu-results.csv'; a.click();
-        URL.revokeObjectURL(u);
-      };
+      useEffect(()=>{
+        const btn = document.getElementById('exportCsv');
+        if(!btn) return;
+        const handler = ()=>{
+          const rows = [['Title','Odds','Implied','Adjusted','Stake','EV','Kelly','Kelly $','Summary','Notes']];
+          for(const rec of results){
+            const k$ = ((rec.kelly??0)*bankroll) || 0;
+            const oddsLabel = rec.american!=null && rec.american!=='' ? (rec.american>0?`+${rec.american}`:String(rec.american)) : '';
+            rows.push([
+              rec.title || rec.fileName || 'Bet',
+              oddsLabel,
+              Math.round((rec.base??0.5)*100)+'%',
+              Math.round((rec.model??rec.base??0.5)*100)+'%',
+              (rec.stake??100).toFixed(2),
+              (rec.ev??0).toFixed(2),
+              (rec.kelly??0).toFixed(3),
+              k$.toFixed(2),
+              (rec.summary||'').replace(/\s+/g,' ').trim(),
+              (rec.notes||'').replace(/\s+/g,' ').trim()
+            ]);
+          }
+          const csv = rows.map(r=>r.join(',')).join('\n');
+          const blob = new Blob([csv],{type:'text/csv'});
+          const u = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = u; a.download = 'csu-results.csv'; a.click();
+          URL.revokeObjectURL(u);
+        };
+        btn.addEventListener('click', handler);
+        return ()=> btn.removeEventListener('click', handler);
+      },[results,bankroll]);
 
       // Paste images from clipboard
       useEffect(()=>{
@@ -514,25 +574,10 @@
         return ()=> window.removeEventListener('paste', onPaste);
       },[]);
 
-      useEffect(()=>{
-        try{
-          const storedResults = JSON.parse(localStorage.getItem(LS_RESULTS)||'[]');
-          const t = JSON.parse(localStorage.getItem(LS_TEAMS)||'{}');
-          if(Array.isArray(storedResults)) setResults(storedResults.map(s=>buildSlipMetrics(s, teams)));
-          if(t && t.A) setTeams(t);
-        }catch(_){}
-      },[]);
-      useEffect(()=>{ try{localStorage.setItem(LS_RESULTS,JSON.stringify(results));}catch(_){ } },[results]);
-      useEffect(()=>{ try{localStorage.setItem(LS_TEAMS,JSON.stringify(teams));}catch(_){ } },[teams]);
+      useEffect(()=>{ if(typeof localStorage==='undefined') return; try{localStorage.setItem(LS_RESULTS,JSON.stringify(results));}catch(_){ } },[results]);
+      useEffect(()=>{ if(typeof localStorage==='undefined') return; try{localStorage.setItem(LS_TEAMS,JSON.stringify(teams));}catch(_){ } },[teams]);
 
-      const onFiles = useCallback(async (incoming)=>{
-        const list = Array.from(incoming||[]).slice(0,12);
-        if(list.length===0) return;
-        setFiles(p=>p.concat(list));
-        for(const f of list) await analyzeOne(f);
-      },[]);
-
-      async function analyzeOne(file){
+      const analyzeOne = useCallback(async (file)=>{
         let text = '';
         let confidence = null;
         try{
@@ -568,7 +613,21 @@
           }, teams);
           setResults(prev => prev.concat(fallback));
         }
-      }
+      },[teams]);
+
+      const onFiles = useCallback(async (incoming)=>{
+        const list = Array.from(incoming||[]).slice(0,12);
+        if(list.length===0) return;
+        const stamp = Date.now();
+        let idx = 0;
+        const descriptors = list.map(f=>({
+          id: `${stamp}-${idx++}-${f.name}`,
+          name: f.name,
+          size: f.size
+        }));
+        setFiles(p=>p.concat(descriptors));
+        for(const f of list) await analyzeOne(f);
+      },[analyzeOne]);
 
       const updateSlip = useCallback((id, patch)=>{
         setResults(prev => prev.map(slip => slip.id===id ? buildSlipMetrics({...slip, ...patch}, teams) : slip));
@@ -612,7 +671,7 @@
             ),
             e('div',{className:'muted',style:{marginTop:8}},'Tip: host must allow CORS for in‑browser OCR when using URLs.')
           ),
-          e('div',{className:'badges'}, ...files.map(f=>e('div',{className:'badge',key:f.name}, `${f.name} • ${bytes(f.size)}`)))
+          e('div',{className:'badges'}, ...files.map(f=>e('div',{className:'badge',key:f.id}, `${f.name} • ${bytes(f.size)}`)))
         ),
         e('section',{className:'panel'},
           e('h3',null,'EdgeLab'),
