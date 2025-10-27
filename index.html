@@ -58,6 +58,7 @@
     .btn-primary:hover{transform:translateY(-1px)}
     .btn-ghost{color:var(--ink);background:var(--panel);border:1px solid #e5e7eb;box-shadow:0 4px 10px rgba(2,6,23,.06)}
     .dark .btn-ghost{border-color:#374151}
+    .btn-small{padding:8px 12px;font-size:12px}
     .badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
     .badge{font-size:12px;padding:6px 10px;border-radius:999px;border:1px solid #e5e7eb;background:#f8fafc;font-weight:700}
     .dark .badge{background:#111827;border-color:#374151}
@@ -72,6 +73,23 @@
     .wl button.active.loss{background:#fff1f2;border-color:#fecdd3;color:#be123c}
     .ring{display:flex;align-items:center;gap:10px}
     .score{font-size:12px;color:var(--muted)}
+    .slip-card{display:flex;gap:14px;align-items:flex-start;border:1px solid #eef2f7;background:var(--panel);
+      border-radius:16px;padding:14px;min-width:280px;box-shadow:0 10px 32px rgba(15,23,42,.05)}
+    .dark .slip-card{border-color:#1f2937;box-shadow:0 12px 40px rgba(2,6,23,.35)}
+    .slip-main{flex:1;display:flex;flex-direction:column;gap:10px}
+    .slip-head{display:flex;align-items:center;gap:10px;justify-content:space-between}
+    .slip-title-input{font-weight:800;font-size:16px;border:0;background:transparent;color:var(--ink);width:100%}
+    .slip-title-input:focus{outline:none}
+    .slip-meta{display:flex;flex-wrap:wrap;gap:6px;font-size:12px;color:var(--muted)}
+    .slip-meta span{background:rgba(148,163,184,.16);padding:4px 10px;border-radius:999px}
+    .dark .slip-meta span{background:rgba(55,65,81,.6);color:#e5e7eb}
+    .slip-actions{display:flex;flex-wrap:wrap;gap:10px}
+    .slip-actions label{display:flex;flex-direction:column;font-size:11px;color:var(--muted);gap:4px}
+    .slip-actions .input{width:110px}
+    .slip-summary{font-size:12px;color:var(--muted);line-height:1.5}
+    textarea.snippet{width:100%;min-height:72px;border-radius:12px;border:1px solid #e5e7eb;padding:10px;background:var(--panel);
+      color:var(--ink);font-size:12px;font-family:inherit;resize:vertical}
+    .dark textarea.snippet{border-color:#374151;background:#0f172a;color:#e5e7eb}
     footer{padding:18px;text-align:center;color:#94a3b8;font-size:12px}
     .about p{margin:0 0 10px 0;line-height:1.6}
     .toolbar{display:flex;gap:8px;align-items:center}
@@ -117,23 +135,230 @@
     });
 
     const e = React.createElement;
-    const { useState, useEffect, useRef, useCallback } = React;
+    const { useState, useEffect, useCallback, useRef, useMemo } = React;
 
     const clamp01 = (x) => Math.max(0, Math.min(1, x));
     const americanToProb = (odds) => (odds > 0 ? 100 / (odds + 100) : -odds / (-odds + 100));
     const toDecimal = (odds) => odds>0 ? (1 + odds/100) : (1 + 100/Math.abs(odds));
     const ODDS_RE = /([+\-]\s?\d{2,4})/;
-    const LS_RESULTS = "csu_results_v2";
+    const ODDS_GLOBAL = /([+\-]\s?\d{2,4})/g;
+    const DOLLAR_RE = /\$[\d,]+(?:\.\d+)?/;
+    const MONEY_STRIP_RE = /\$?[\d,]+(?:\.\d+)?/g;
+    const LS_RESULTS = "csu_results_v3";
     const LS_TEAMS   = "csu_teams_v2";
+
+    const DEFAULT_TEAMS = Object.freeze({
+      A:{name:'',win:0.5,margin:0,inj:0,wl:'-----'},
+      B:{name:'',win:0.5,margin:0,inj:0,wl:'-----'}
+    });
+
+    function cloneTeams(src){
+      return {
+        A:{...DEFAULT_TEAMS.A,...(src && src.A || {})},
+        B:{...DEFAULT_TEAMS.B,...(src && src.B || {})},
+      };
+    }
+
+    function loadStoredTeams(){
+      if(typeof localStorage==='undefined') return cloneTeams();
+      try{
+        const parsed = JSON.parse(localStorage.getItem(LS_TEAMS) || 'null');
+        if(parsed && parsed.A && parsed.B){
+          return cloneTeams(parsed);
+        }
+      }catch(_){ }
+      return cloneTeams();
+    }
+
+    function loadStoredResults(teams){
+      if(typeof localStorage==='undefined') return [];
+      try{
+        const parsed = JSON.parse(localStorage.getItem(LS_RESULTS) || '[]');
+        if(Array.isArray(parsed)){
+          return parsed.map(item=>buildSlipMetrics(item, teams));
+        }
+      }catch(_){ }
+      return [];
+    }
 
     function bytes(n){return n>1048576? (n/1048576).toFixed(1)+' MB' : n>1024? (n/1024).toFixed(1)+' KB' : n+' B'}
 
-    function parseImpliedFromText(text){
-      const m = text.match(ODDS_RE);
+    const usd = new Intl.NumberFormat(undefined,{style:'currency',currency:'USD',maximumFractionDigits:2});
+    const pctFmt = new Intl.NumberFormat(undefined,{style:'percent',maximumFractionDigits:1});
+
+    function formatCurrency(n){
+      if(!Number.isFinite(n)) return '$0.00';
+      return usd.format(n);
+    }
+
+    function formatPercent(n){
+      if(!Number.isFinite(n)) return '0%';
+      return pctFmt.format(n);
+    }
+
+    function toCsv(rows){
+      return rows.map(row=>row.map(cell=>{
+        const text = cell==null ? '' : String(cell);
+        return /[",\n]/.test(text) ? '"'+text.replace(/"/g,'""')+'"' : text;
+      }).join(',')).join('\n');
+    }
+
+    function findAmericanOdds(text){
+      const m = text && text.match(ODDS_RE);
       if(!m) return null;
       const num = Number(m[0].replace(/\s/g,''));
-      if(Number.isNaN(num)) return null;
+      return Number.isNaN(num) ? null : num;
+    }
+
+    function parseImpliedFromText(text){
+      const num = findAmericanOdds(text);
+      if(num==null) return null;
       return americanToProb(num);
+    }
+
+    function cleanName(str){
+      return (str||'').replace(/[^A-Za-z0-9&'\s]/g,'').replace(/\s{2,}/g,' ').trim();
+    }
+
+    function guessParticipants(lines){
+      const text = (lines||[]).filter(Boolean).join(' ').replace(/\s{2,}/g,' ').trim();
+      if(!text) return [];
+      const vsSplit = text.split(/\b(?:vs\.?|@|at)\b/i);
+      if(vsSplit.length>=2){
+        return vsSplit.slice(0,2).map(cleanName).filter(Boolean).slice(0,2);
+      }
+      const tokens = text.split(/[^A-Za-z0-9&']+/).filter(Boolean);
+      const picks=[];
+      for(let i=0;i<tokens.length;i++){
+        const word=tokens[i];
+        if(word.length<3) continue;
+        if(word===word.toUpperCase() && /[A-Z]/.test(word)){ picks.push(cleanName(word)); }
+      }
+      if(picks.length>=2) return picks.slice(0,2);
+      const titleCase=[];
+      for(let i=0;i<tokens.length-1;i++){
+        const a=tokens[i], b=tokens[i+1];
+        if(a[0]===a[0].toUpperCase() && b[0]===b[0].toUpperCase()){
+          titleCase.push(cleanName(a+' '+b));
+        }
+      }
+      return titleCase.slice(0,2);
+    }
+
+    function extractSlips(text='', fileName=''){ 
+      const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+      const slips=[];
+      const stamp = Date.now().toString(36);
+      let counter=0;
+      for(let i=0;i<lines.length;i++){
+        const line = lines[i];
+        const matches = Array.from(line.matchAll(ODDS_GLOBAL));
+        if(!matches.length) continue;
+        matches.forEach((match, idx)=>{
+          const num = Number(match[0].replace(/\s/g,''));
+          if(Number.isNaN(num)) return;
+          const before = line.slice(0, match.index||0).trim();
+          const after = line.slice((match.index||0)+match[0].length).trim();
+          const rawLabel = [before, after].filter(Boolean).join(' ').trim();
+          const label = cleanName(rawLabel.replace(MONEY_STRIP_RE,' ').trim()) || cleanName(lines[i-1] || '');
+          const stakeMatch = line.match(DOLLAR_RE);
+          const stake = stakeMatch ? Number(stakeMatch[0].replace(/[$,]/g,'')) : undefined;
+          const context = [lines[i-1], line, lines[i+1]].filter(Boolean);
+          slips.push({
+            id: `${fileName||'slip'}-${stamp}-${counter++}-${idx}`,
+            fileName,
+            title: label || `${fileName||'Bet'} ${counter}`,
+            american: num,
+            stake,
+            textSnippet: context.join(' • '),
+            rawLine: line,
+            participants: guessParticipants(context),
+            rawText: text,
+          });
+        });
+      }
+      if(!slips.length){
+        const implied = parseImpliedFromText(text);
+        if(implied!=null){
+          slips.push({
+            id: `${fileName||'slip'}-${stamp}-0`,
+            fileName,
+            base: implied,
+            title: cleanName(fileName) || 'Untitled Bet',
+            american: findAmericanOdds(text),
+            textSnippet: lines.slice(0,4).join(' • '),
+            rawLine: lines[0] || '',
+            participants: guessParticipants(lines.slice(0,3)),
+            rawText: text,
+          });
+        }
+      }
+      return slips;
+    }
+
+    function craftSummary(slip){
+      if(!slip) return '';
+      const base = slip.base ?? 0.5;
+      const model = slip.model ?? base;
+      const edge = slip.edge ?? (model - base);
+      const implied = Math.round(base*100);
+      const adjusted = Math.round(model*100);
+      const edgePts = (edge*100).toFixed(1);
+      const stake = Number.isFinite(slip.stake)? slip.stake : 100;
+      const ev = (slip.ev ?? 0).toFixed(2);
+      const label = (slip.participants && slip.participants.length>=2)
+        ? slip.participants.slice(0,2).join(' vs ')
+        : (slip.title || 'This market');
+      const kelly = slip.kelly ?? 0;
+      let verdict;
+      if(model>=0.6) verdict = 'Aggressive lean: the model sees a strong edge.';
+      else if(model>=0.55) verdict = 'Solid lean: consider a half-Kelly sizing.';
+      else if(model>=0.5) verdict = 'Thin edge: keep stakes small and confirm with other signals.';
+      else verdict = 'Negative EV: best to pass unless you have extra context.';
+      const kellyTxt = kelly>0 ? ` Kelly suggests staking ${(kelly*100).toFixed(1)}% of bankroll.` : ' Kelly indicates little to no stake.';
+      const conf = slip.confidence!=null ? ` OCR confidence ${Math.round(slip.confidence*100)}%.` : '';
+      return `${label} shows implied ${implied}% vs adjusted ${adjusted}% (edge ${edgePts} pts). EV on $${stake.toFixed(2)} is ${ev}. ${verdict}${kellyTxt}${conf}`;
+    }
+
+    function buildSlipMetrics(slip, teams){
+      const next = {...slip};
+      const americanNum = next.american==='' ? null : Number(next.american);
+      const hasOdds = americanNum!=null && !Number.isNaN(americanNum);
+      if(hasOdds) next.american = americanNum;
+      const baseFromText = parseImpliedFromText(next.textSnippet || next.rawLine || next.rawText || '') ?? next.base ?? 0.5;
+      const base = hasOdds ? americanToProb(americanNum) : baseFromText;
+      const fallbackOdds = base>=0.5 ? -110 : 110;
+      const decimal = hasOdds ? toDecimal(americanNum) : toDecimal(fallbackOdds);
+      const teamA = teams?.A || {};
+      const teamB = teams?.B || {};
+      const getWin = (team)=>{
+        if(team && typeof team.win === 'number' && !Number.isNaN(team.win)) return clamp01(team.win);
+        if(team && typeof team.wl === 'string') return pctFromWL(team.wl);
+        return 0.5;
+      };
+      const aWin = getWin(teamA);
+      const bWin = getWin(teamB);
+      const model = adjustProb(base, aWin, bWin, teamA.margin||0, teamB.margin||0, teamA.inj||0, teamB.inj||0);
+      let stakeVal = Number(next.stake);
+      if(next.stake==='' || next.stake==null || Number.isNaN(stakeVal)) stakeVal = 100;
+      if(stakeVal<0) stakeVal = 0;
+      const profit = stakeVal * (decimal - 1);
+      const ev = (model * profit) - ((1 - model) * stakeVal);
+      const kelly = decimal>1 ? kellyFraction(model, decimal) : 0;
+      const edge = model - base;
+      const enriched = {
+        ...next,
+        stake: stakeVal,
+        base,
+        model,
+        decimal,
+        ev,
+        kelly,
+        edge,
+        updatedAt: Date.now(),
+      };
+      enriched.summary = craftSummary(enriched);
+      return enriched;
     }
 
     function adjustProb(base, aWin=0.5, bWin=0.5, aMargin=0, bMargin=0, aInj=0, bInj=0){
@@ -188,57 +413,213 @@
 
     function TeamCard({ side='A', data, onChange }){
       const set=(k,v)=>onChange({...data,[k]:v});
+      const parseNumber=(raw)=> raw==='' ? '' : Number(raw);
       return e('div',{className:'team'},
         e('div',{className:'k'}, `Team ${side}`),
         e('div',{className:'row'},
           e('input',{className:'input',placeholder:'Team name (optional)', value:data.name||'', onChange:e=>set('name',e.target.value)}),
           e('input',{className:'input num',type:'number',step:'0.01',min:'0',max:'1',placeholder:'Win%',
-            value:data.win ?? '', onChange:e=>set('win',Number(e.target.value))}),
+            value:data.win ?? '', onChange:e=>set('win',parseNumber(e.target.value))}),
           e('input',{className:'input num',type:'number',step:'1',placeholder:'+/- margin',
-            value:data.margin ?? '', onChange:e=>set('margin',Number(e.target.value))}),
+            value:data.margin ?? '', onChange:e=>set('margin',parseNumber(e.target.value))}),
           e('input',{className:'input num',type:'number',step:'1',placeholder:'Injuries',
-            value:data.inj ?? '', onChange:e=>set('inj',Number(e.target.value))}),
+            value:data.inj ?? '', onChange:e=>set('inj',parseNumber(e.target.value))}),
         ),
         e('div',{className:'k',style:{marginTop:8}},'Last 5 (tap to set):'),
         e(WLPicker,{value:data.wl||'-----', onChange:(wl)=>set('wl',wl)})
       );
     }
 
+    function SlipCard({slip, bankroll=0, onChange, onRemove}){
+      const participants = Array.isArray(slip.participants) ? slip.participants : [];
+      const chips = [];
+      participants.forEach((name, idx)=>{ if(name) chips.push(e('span',{key:`p-${idx}`}, name)); });
+      const oddsDisplay = slip.american!=null && slip.american!=='' ? (Number(slip.american)>0?`+${slip.american}`:String(slip.american)) : '—';
+      chips.push(e('span',{key:'odds'}, `Odds ${oddsDisplay}`));
+      chips.push(e('span',{key:'implied'}, `Implied ${Math.round((slip.base??0.5)*100)}%`));
+      chips.push(e('span',{key:'adjusted'}, `Adjusted ${Math.round((slip.model??slip.base??0.5)*100)}%`));
+      chips.push(e('span',{key:'edge'}, `Edge ${((slip.edge??0)*100).toFixed(1)} pts`));
+      if(Number.isFinite(slip.ev)) chips.push(e('span',{key:'ev'}, `EV $${(slip.ev??0).toFixed(2)}`));
+      const kellyPct = (slip.kelly??0)*100;
+      if(!Number.isNaN(kellyPct)) chips.push(e('span',{key:'kelly'}, `Kelly ${kellyPct.toFixed(1)}%`));
+      const kellyCash = ((slip.kelly??0)*bankroll) || 0;
+      chips.push(e('span',{key:'kellyCash'}, `Kelly $${kellyCash.toFixed(2)}`));
+      if(slip.bytes!=null) chips.push(e('span',{key:'size'}, bytes(slip.bytes)));
+      if(slip.confidence!=null) chips.push(e('span',{key:'conf'}, `OCR ${(slip.confidence*100).toFixed(0)}%`));
+
+      const handleOdds = (ev)=>{
+        const val = ev.target.value;
+        onChange({american: val === '' ? '' : Number(val)});
+      };
+      const handleStake = (ev)=>{
+        const val = ev.target.value;
+        onChange({stake: val === '' ? '' : Number(val)});
+      };
+      const handleTitle = (ev)=> onChange({title: ev.target.value});
+      const handleNotes = (ev)=> onChange({notes: ev.target.value});
+      const handleSnippet = (ev)=> onChange({textSnippet: ev.target.value});
+      const copyText = ()=>{
+        const payload = slip.rawText || slip.textSnippet || '';
+        if(!payload) return;
+        try{
+          if(typeof navigator!=='undefined' && navigator.clipboard && navigator.clipboard.writeText){
+            navigator.clipboard.writeText(payload).catch(()=>{});
+          }else{
+            const ta = document.createElement('textarea');
+            ta.value = payload;
+            document.body.appendChild(ta);
+            ta.select();
+            try{ document.execCommand('copy'); }catch(_){ }
+            document.body.removeChild(ta);
+          }
+        }catch(_){ }
+      };
+
+      return e('div',{className:'slip-card'},
+        e(Ring,{value:slip.model ?? slip.base ?? 0.5,size:80}),
+        e('div',{className:'slip-main'},
+          e('div',{className:'slip-head'},
+            e('input',{className:'slip-title-input',value:slip.title||'',placeholder:'Label this bet',onChange:handleTitle}),
+            e('div',{className:'row',style:{gap:6}},
+              e('button',{type:'button',className:'btn btn-ghost btn-small',onClick:copyText},'Copy OCR'),
+              e('button',{type:'button',className:'btn btn-ghost btn-small',onClick:onRemove},'Remove')
+            )
+          ),
+          chips.length? e('div',{className:'slip-meta'}, ...chips) : null,
+          e('div',{className:'slip-actions'},
+            e('label',null,'Odds',
+              e('input',{className:'input',type:'number',step:'1',value:slip.american==null || slip.american===''? '' : slip.american,onChange:handleOdds,placeholder:'+120'})
+            ),
+            e('label',null,'Stake $',
+              e('input',{className:'input',type:'number',step:'1',value:slip.stake==null || slip.stake===''? '' : slip.stake,onChange:handleStake,placeholder:'100'})
+            ),
+            e('label',{style:{flex:1}},'Notes',
+              e('input',{className:'input',value:slip.notes||'',onChange:handleNotes,placeholder:'Optional tag'})
+            )
+          ),
+          e('div',{className:'slip-summary'}, slip.summary || 'Model will fill in a recommendation once odds are recognized.'),
+          e('textarea',{className:'snippet',value:slip.textSnippet||'',onChange:handleSnippet,placeholder:'OCR snippet (editable for clarity)'}),
+          slip.rawLine ? e('div',{className:'slip-line'},`Source: ${slip.rawLine}`) : null
+        )
+      );
+    }
+
     function About(){
       return e('section',{className:'panel about', style:{maxWidth:1000, marginInline:'auto'}},
         e('h3',null,'About CSU Pro'),
-        e('p',null,'CSU Pro transforms sportsbook screenshots into structured slips, computes implied probability, Expected Value and Kelly sizing, and blends recent form, scoring margin, and injuries into a cleaner win probability. Clean iOS-style UI, local-first privacy, and export/share tools.')
+        e('p',null,'CSU Pro transforms sportsbook screenshots into structured slips, computes implied probability, Expected Value and Kelly sizing, and blends recent form, scoring margin, and injuries into a cleaner win probability. The EdgeLab workspace now auto-detects multiple bets in a single image, generates plain-language verdicts, and keeps everything editable with on-device OCR. Clean iOS-style UI, local-first privacy, and export/share tools.')
       );
     }
 
     function App(){
-      const [results,setResults] = useState({});
+      const initialTeamsRef = useRef(null);
+      if(initialTeamsRef.current==null){
+        initialTeamsRef.current = loadStoredTeams();
+      }
+
+      const [teams,setTeams] = useState(initialTeamsRef.current);
+      const [results,setResults] = useState(()=>loadStoredResults(initialTeamsRef.current));
       const [files,setFiles] = useState([]);
       const [imgUrl,setImgUrl] = useState('');
       const [auto,setAuto] = useState(true);
-      const [teams,setTeams] = useState({A:{name:'',win:0.5,margin:0,inj:0,wl:'-----'}, B:{name:'',win:0.5,margin:0,inj:0,wl:'-----'}});
-      const [bankroll, setBankroll] = useState(Number(localStorage.getItem('csu_bankroll')||2500));
+      const initialBankroll = (()=>{
+        if(typeof localStorage==='undefined') return 2500;
+        const raw = Number(localStorage.getItem('csu_bankroll'));
+        return Number.isFinite(raw) ? raw : 2500;
+      })();
+      const [bankroll, setBankroll] = useState(initialBankroll);
 
-      useEffect(()=>{ localStorage.setItem('csu_bankroll', String(bankroll)); },[bankroll]);
-
-      // wire input control in header
-      const brEl = document.getElementById('bankroll');
-      if(brEl){ brEl.value = String(bankroll); brEl.oninput = (ev)=> setBankroll(Number(ev.target.value||0)); }
-
-      // CSV export
-      document.getElementById('exportCsv').onclick = ()=>{
-        const rows = [['Name','Implied','Adjusted','EV@100','Kelly','Kelly$']];
-        for(const [name,rec] of Object.entries(results)){
-          const k$ = (rec.kelly??0)*bankroll;
-          rows.push([name, Math.round((rec.base??0.5)*100)+'%', Math.round((rec.model??rec.base??0.5)*100)+'%', (rec.ev??0).toFixed(2), (rec.kelly??0).toFixed(3), k$.toFixed(2)]);
+      const summary = useMemo(()=>{
+        if(!results.length){
+          return {count:0,totalStake:0,totalEv:0,kellyStake:0,avgEdge:0,avgKelly:0,positive:0,hitRate:0};
         }
-        const csv = rows.map(r=>r.join(',')).join('\n');
-        const blob = new Blob([csv],{type:'text/csv'});
-        const u = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = u; a.download = 'csu-results.csv'; a.click();
-        URL.revokeObjectURL(u);
-      };
+        let totalStake = 0;
+        let totalEv = 0;
+        let kellyStake = 0;
+        let totalEdge = 0;
+        let totalKelly = 0;
+        let positive = 0;
+        for(const rec of results){
+          const stake = Number.isFinite(rec.stake) ? rec.stake : 0;
+          const ev = Number.isFinite(rec.ev) ? rec.ev : 0;
+          const kelly = Number.isFinite(rec.kelly) ? rec.kelly : 0;
+          const edge = Number.isFinite(rec.edge) ? rec.edge : 0;
+          totalStake += stake;
+          totalEv += ev;
+          totalEdge += edge;
+          totalKelly += kelly;
+          kellyStake += kelly * bankroll;
+          if((rec.model ?? rec.base ?? 0.5) >= (rec.base ?? 0.5)) positive += 1;
+        }
+        const count = results.length;
+        return {
+          count,
+          totalStake,
+          totalEv,
+          kellyStake,
+          avgEdge: totalEdge / count,
+          avgKelly: totalKelly / count,
+          positive,
+          hitRate: positive / count,
+        };
+      },[results,bankroll]);
+
+      const sortedResults = useMemo(()=>{
+        return [...results].sort((a,b)=>{
+          const aStamp = a.updatedAt || a.createdAt || 0;
+          const bStamp = b.updatedAt || b.createdAt || 0;
+          return bStamp - aStamp;
+        });
+      },[results]);
+
+      useEffect(()=>{ if(typeof localStorage==='undefined') return; localStorage.setItem('csu_bankroll', String(bankroll)); },[bankroll]);
+
+      useEffect(()=>{
+        const brEl = document.getElementById('bankroll');
+        if(!brEl) return;
+        const handler = (ev)=>{
+          const val = ev.target.value;
+          if(val===''){ setBankroll(0); return; }
+          const parsed = Number(val);
+          if(Number.isFinite(parsed)) setBankroll(parsed);
+        };
+        brEl.value = String(bankroll);
+        brEl.addEventListener('input', handler);
+        return ()=> brEl.removeEventListener('input', handler);
+      },[bankroll]);
+
+      useEffect(()=>{
+        const btn = document.getElementById('exportCsv');
+        if(!btn) return;
+        const handler = ()=>{
+          const rows = [['Title','Odds','Implied','Adjusted','Stake','EV','Kelly','Kelly $','Summary','Notes','Source']];
+          for(const rec of results){
+            const k$ = ((rec.kelly??0)*bankroll) || 0;
+            const oddsLabel = rec.american!=null && rec.american!=='' ? (rec.american>0?`+${rec.american}`:String(rec.american)) : '';
+            rows.push([
+              rec.title || rec.fileName || 'Bet',
+              oddsLabel,
+              Math.round((rec.base??0.5)*100)+'%',
+              Math.round((rec.model??rec.base??0.5)*100)+'%',
+              (rec.stake??100).toFixed(2),
+              (rec.ev??0).toFixed(2),
+              (rec.kelly??0).toFixed(3),
+              k$.toFixed(2),
+              (rec.summary||'').replace(/\s+/g,' ').trim(),
+              (rec.notes||'').replace(/\s+/g,' ').trim(),
+              (rec.fileName||'')
+            ]);
+          }
+          const csv = toCsv(rows);
+          const blob = new Blob([csv],{type:'text/csv'});
+          const u = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = u; a.download = 'csu-results.csv'; a.click();
+          URL.revokeObjectURL(u);
+        };
+        btn.addEventListener('click', handler);
+        return ()=> btn.removeEventListener('click', handler);
+      },[results,bankroll]);
 
       // Paste images from clipboard
       useEffect(()=>{
@@ -258,61 +639,88 @@
         return ()=> window.removeEventListener('paste', onPaste);
       },[]);
 
-      useEffect(()=>{
+      useEffect(()=>{ if(typeof localStorage==='undefined') return; try{localStorage.setItem(LS_RESULTS,JSON.stringify(results));}catch(_){ } },[results]);
+      useEffect(()=>{ if(typeof localStorage==='undefined') return; try{localStorage.setItem(LS_TEAMS,JSON.stringify(teams));}catch(_){ } },[teams]);
+
+      const analyzeOne = useCallback(async (file)=>{
+        let text = '';
+        let confidence = null;
         try{
-          const r = JSON.parse(localStorage.getItem(LS_RESULTS)||'{}');
-          const t = JSON.parse(localStorage.getItem(LS_TEAMS)||'{}');
-          if(r && typeof r==='object') setResults(r);
-          if(t && t.A) setTeams(t);
-        }catch(_){}
-      },[]);
-      useEffect(()=>{ try{localStorage.setItem(LS_RESULTS,JSON.stringify(results));}catch(_){ } },[results]);
-      useEffect(()=>{ try{localStorage.setItem(LS_TEAMS,JSON.stringify(teams));}catch(_){ } },[teams]);
+          const o = await Tesseract.recognize(file,'eng');
+          text = (o && o.data && o.data.text) ? o.data.text : '';
+          const conf = o && o.data && typeof o.data.confidence === 'number' ? o.data.confidence : null;
+          confidence = conf!=null ? clamp01(conf/100) : null;
+        }catch(_){ }
+        const parsed = extractSlips(text, file.name);
+        const stamp = Date.now();
+        if(parsed.length){
+          const enriched = parsed.map((slip, idx)=>buildSlipMetrics({
+            ...slip,
+            rawText:text,
+            bytes:file.size,
+            confidence,
+            createdAt: stamp + idx,
+          }, teams));
+          setResults(prev => prev.concat(enriched));
+        }else{
+          const fallback = buildSlipMetrics({
+            id: `${file.name||'slip'}-${stamp}`,
+            fileName: file.name,
+            title: cleanName(file.name) || 'Bet',
+            base: parseImpliedFromText(text) ?? 0.5,
+            american: findAmericanOdds(text),
+            textSnippet: text.split(/\r?\n/).slice(0,3).join(' • '),
+            rawLine: text.split(/\r?\n/)[0] || '',
+            rawText: text,
+            confidence,
+            bytes:file.size,
+            createdAt: stamp,
+          }, teams);
+          setResults(prev => prev.concat(fallback));
+        }
+      },[teams]);
 
       const onFiles = useCallback(async (incoming)=>{
         const list = Array.from(incoming||[]).slice(0,12);
         if(list.length===0) return;
-        setFiles(p=>p.concat(list));
+        const stamp = Date.now();
+        let idx = 0;
+        const descriptors = list.map(f=>({
+          id: `${stamp}-${idx++}-${f.name}`,
+          name: f.name,
+          size: f.size
+        }));
+        setFiles(p=>p.concat(descriptors));
         for(const f of list) await analyzeOne(f);
+      },[analyzeOne]);
+
+      const updateSlip = useCallback((id, patch)=>{
+        setResults(prev => prev.map(slip => slip.id===id ? buildSlipMetrics({...slip, ...patch, updatedAt: Date.now()}, teams) : slip));
+      },[teams]);
+
+      const removeSlip = useCallback((id)=>{
+        setResults(prev => prev.filter(slip => slip.id!==id));
       },[]);
 
-      async function analyzeOne(file){
-        let text = '';
-        try{
-          const o = await Tesseract.recognize(file,'eng');
-          text = (o && o.data && o.data.text) ? o.data.text : '';
-        }catch(_){}
-        const base = parseImpliedFromText(text) ?? 0.56;
-        const aWin = teams.A.win ?? pctFromWL(teams.A.wl);
-        const bWin = teams.B.win ?? pctFromWL(teams.B.wl);
-        const model = adjustProb(base, aWin, bWin, teams.A.margin, teams.B.margin, teams.A.inj, teams.B.inj);
+      const clearResults = useCallback(()=>{
+        if(!results.length) return;
+        const proceed = typeof window === 'undefined' ? true : window.confirm('Clear all analyzed slips?');
+        if(proceed){
+          setResults([]);
+          setFiles([]);
+        }
+      },[results.length]);
 
-        const stake = 100;
-        const dec = (model>=0.5)? (1 + 100/110) : (1 + 110/100); // placeholder
-        const ev  = (model * (dec - 1) * stake) - ((1 - model) * stake);
-        const kelly = kellyFraction(model, dec);
-
-        setResults(r=>({...r,[file.name]:{base,model,bytes:file.size,ev,kelly}}));
-      }
+      const resetTeams = useCallback(()=>{
+        const proceed = typeof window === 'undefined' ? true : window.confirm('Reset team adjustments to defaults?');
+        if(proceed){
+          setTeams(cloneTeams());
+        }
+      },[]);
 
       function recomputeAll(){
-        setResults(r=>{
-          const aW = (teams.A.win!==undefined && !isNaN(teams.A.win))? teams.A.win : pctFromWL(teams.A.wl);
-          const bW = (teams.B.win!==undefined && !isNaN(teams.B.win))? teams.B.win : pctFromWL(teams.B.wl);
-          const next={};
-          for(const k in r){
-            const base=r[k].base ?? 0.56;
-            const model = adjustProb(base, aW,bW, teams.A.margin,teams.B.margin, teams.A.inj,teams.B.inj);
-            const stake = 100;
-            const dec = (model>=0.5)? (1 + 100/110) : (1 + 110/100);
-            const ev  = (model * (dec - 1) * stake) - ((1 - model) * stake);
-            const kelly = kellyFraction(model, dec);
-            next[k]={...r[k], model, ev, kelly};
-          }
-          return next;
-        });
+        setResults(prev => prev.map(slip => buildSlipMetrics(slip, teams)));
       }
-      useEffect(()=>{ recomputeAll(); },[bankroll]);
       useEffect(()=>{ if(auto) recomputeAll(); },[teams,auto]);
 
       const onDrop = (e)=>{ e.preventDefault(); onFiles(e.dataTransfer && e.dataTransfer.files); }
@@ -344,7 +752,7 @@
             ),
             e('div',{className:'muted',style:{marginTop:8}},'Tip: host must allow CORS for in‑browser OCR when using URLs.')
           ),
-          e('div',{className:'badges'}, ...files.map(f=>e('div',{className:'badge',key:f.name}, `${f.name} • ${bytes(f.size)}`)))
+          e('div',{className:'badges'}, ...files.map(f=>e('div',{className:'badge',key:f.id}, `${f.name} • ${bytes(f.size)}`)))
         ),
         e('section',{className:'panel'},
           e('h3',null,'EdgeLab'),
@@ -355,21 +763,38 @@
           e('div',{className:'row',style:{marginTop:10,alignItems:'center',justifyContent:'space-between'}},
             e('label',null,
               e('input',{type:'checkbox',checked:auto,onChange:(ev)=>setAuto(ev.target.checked)}),' Live Auto‑Recompute'),
-            e('button',{className:'btn btn-primary',onClick:recomputeAll},'Recompute Model')
+            e('div',{className:'row',style:{gap:8}},
+              e('button',{className:'btn btn-ghost',onClick:resetTeams},'Reset teams'),
+              e('button',{className:'btn btn-primary',onClick:recomputeAll},'Recompute Model')
+            )
           )
         ),
         e('section',{className:'panel'},
           e('h3',null,'Results'),
-          e('div',{className:'row',style:{gap:12,alignItems:'stretch',flexWrap:'wrap'}},
-            ...Object.entries(results).map(([name,rec])=>e('div',{key:name,style:{display:'flex',alignItems:'center',gap:14,border:'1px solid #eef2f7',borderRadius:12,padding:'12px 14px',background:'var(--panel)'}},
-              e(Ring,{value:rec.model ?? rec.base ?? 0.5}),
-              e('div',null,
-                e('div',{style:{fontWeight:900}}, name),
-                e('div',{className:'score'}, `implied ${Math.round((rec.base??0.5)*100)}% • adjusted ${Math.round((rec.model??rec.base??0.5)*100)}%`),
-                e('div',{className:'score'}, `EV @ $100: ${rec.ev?.toFixed(2) ?? '—'} • Kelly: ${(rec.kelly??0).toFixed(3)} • Kelly $ @ bankroll: $${(((rec.kelly??0)*bankroll)||0).toFixed(2)}`)
+          summary.count ? e('div',{className:'row',style:{justifyContent:'space-between',alignItems:'center',gap:10,flexWrap:'wrap',marginBottom:12}},
+              e('div',{className:'badges',style:{marginTop:0}},
+                e('div',{className:'badge',key:'count'}, `${summary.count} slips`),
+                e('div',{className:'badge',key:'stake'}, `Stake ${formatCurrency(summary.totalStake)}`),
+                e('div',{className:'badge',key:'ev'}, `EV ${formatCurrency(summary.totalEv)}`),
+                e('div',{className:'badge',key:'kellySum'}, `Kelly roll ${formatCurrency(summary.kellyStake)}`),
+                e('div',{className:'badge',key:'edge'}, `Avg edge ${(summary.avgEdge*100).toFixed(1)} pts`),
+                e('div',{className:'badge',key:'hit'}, `Positive leans ${formatPercent(summary.hitRate)}`)
+              ),
+              e('div',{className:'row',style:{gap:8}},
+                e('button',{className:'btn btn-ghost btn-small',onClick:clearResults},'Clear all')
               )
-            ))
-          )
+            ) : null,
+          summary.count
+            ? e('div',{className:'row',style:{gap:14,alignItems:'stretch',flexWrap:'wrap'}},
+                sortedResults.map(slip=>e(SlipCard,{
+                  key:slip.id,
+                  slip,
+                  bankroll,
+                  onChange:(patch)=>updateSlip(slip.id, patch),
+                  onRemove:()=>removeSlip(slip.id)
+                }))
+              )
+            : e('div',{className:'muted',style:{padding:'16px 0'}},'No slips yet. Upload a screenshot to analyze a bet.')
         ),
         e(About,null)
       );
